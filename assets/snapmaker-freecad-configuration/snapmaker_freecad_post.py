@@ -29,6 +29,12 @@ import datetime
 import shlex
 from PathScripts import PostUtils
 from PathScripts import PathUtils
+import PathScripts.PathLog as PathLog
+import PathGeom
+import math
+
+LOG_MODULE = PathLog.thisModule()
+PathLog.setLevel(PathLog.Level.ERROR, LOG_MODULE)
 
 TOOLTIP = '''
 This is a postprocessor file for the Path workbench. It is used to
@@ -49,6 +55,8 @@ parser.add_argument('--no-comments', action='store_true', help='suppress comment
 parser.add_argument('--line-numbers', action='store_true', help='prefix with line numbers')
 parser.add_argument('--no-show-editor', action='store_true', help='don\'t pop up editor before writing output')
 parser.add_argument('--precision', default='3', help='number of digits of precision, default=3')
+parser.add_argument('--segments', default='3', help='segments in curved paths: segs/cm, default=40')
+parser.add_argument('--break-straight', action='store_true', help='breaks also straight paths same resolution as in curved paths')
 parser.add_argument('--preamble', help='set commands to be issued before the first command, default="G17\nG90"')
 parser.add_argument('--postamble', help='set commands to be issued after the last command, default="M05\nG17 G90\nM2"')
 parser.add_argument('--inches', action='store_true', help='Convert output for US imperial mode (G20)')
@@ -57,6 +65,58 @@ parser.add_argument('--axis-modal', action='store_true', help='Output the Same A
 parser.add_argument('--no-tlo', action='store_true', help='suppress tool length offset (G43) following tool changes')
 
 TOOLTIP_ARGS = parser.format_help()
+
+# GCodes and GCode parameters =================================================
+
+CMD_MOVE_LINEAR_RAPID = 'G0' # moves linearly to a point
+CMD_MOVE_LINEAR       = 'G1'
+CMD_MOVE_ARC_CW       = 'G2'
+CMD_MOVE_ARC_CCW      = 'G3'
+CMD_MOVE_BEZIER       = 'G5'
+CMD_SPINDLE_ON        = 'M3'
+CMD_SPINDLE_OFF       = 'M5'
+CMD_HOLE_SIMPLE       = 'G81'
+CMD_HOLE_DWELL        = 'G82' 
+CMD_HOLE_PECKED       = 'G83' 
+
+# Param: Movement
+P_POSITION_X = 'X'
+P_POSITION_Y = 'Y'
+P_POSITION_Z = 'Z'
+P_FEEDRATE = 'F'
+
+# Param: Spindle
+P_SPINDLE_RPM = 'S'
+P_SPINDLE_POWER = 'P'
+
+# Param: Drilling
+P_DRILL_RETRACT_HEIGHT = 'R'
+P_PECK_DEPTH = 'Q' # Q = peck distance
+P_DWELL_MS = 'P' # P (ms), S (sec) = Pause time in finished hole
+P_DWELL_S = 'S'
+
+# =============================================================================
+# Machine specific constants
+
+minSpindleRPM = 6000
+minSpindlePower = 50
+maxSpindleRPM = 12000
+maxSpindlePower = 100
+
+# =============================================================================
+moveDrillInRetractHeight = False
+holeRetractionFactor = 10 # vertical feedrate factor on retract. To speed up retraction make factor > 1
+
+# =============================================================================
+# Default move speeds if nothing else is set
+feedrateHorizontal = 600
+feedrateVertical = 300
+# =============================================================================
+# Commands that are not supported by Marlin (movement is simulated)
+commandsToSimulate = [CMD_HOLE_SIMPLE, CMD_HOLE_PECKED, CMD_HOLE_DWELL]
+commandsToConvert = [CMD_MOVE_ARC_CW, CMD_MOVE_ARC_CCW, CMD_MOVE_LINEAR_RAPID, CMD_MOVE_LINEAR, CMD_MOVE_BEZIER]
+
+# =============================================================================
 
 # These globals set common customization preferences
 OUTPUT_COMMENTS = True
@@ -67,8 +127,10 @@ MODAL = False  # if true commands are suppressed if the same as previous line.
 USE_TLO = True # if true G43 will be output following tool changes
 OUTPUT_DOUBLES = True  # if false duplicate axis values are suppressed if the same as previous line.
 COMMAND_SPACE = " "
-COMMANDS = ['G0','G00','G1','G01','G2','G02','G3','G03','M3']
+
 LINENR = 100  # line number starting value
+SEGMENTS_PER_CM_ARC = 40 # Numbers of segments an arc should be broken into within 1cm of arc distance
+BREAK_STRAIGHTS = False # When True, straight lines will be broken into subsegments as curved paths
 
 # These globals will be reflected in the Machine configuration of the project
 UNITS = "G21"  # G21 for metric, G20 for us standard
@@ -81,13 +143,10 @@ CORNER_MAX = {'x': 500, 'y': 300, 'z': 300}
 PRECISION = 3
 
 # Preamble text will appear at the beginning of the GCODE output file.
-PREAMBLE = '''G17 G54 G40 G49 G80 G90
-'''
+PREAMBLE = '''G17 G54 G40 G49 G80 G90'''
 
 # Postamble text will appear following the last operation.
-POSTAMBLE = '''M5
-'''
-
+POSTAMBLE = CMD_SPINDLE_OFF + "\n"
 # Pre operation text will be inserted before every operation
 PRE_OPERATION = ''''''
 
@@ -97,10 +156,20 @@ POST_OPERATION = ''''''
 # Tool Change commands will be inserted before a tool change
 TOOL_CHANGE = ''''''
 
+currentHeadPosition = FreeCAD.Vector(0,0,0)
+
 # to distinguish python built-in open function from the one declared below
 if open.__module__ in ['__builtin__','io']:
     pythonopen = open
 
+def log(msg):
+    PathLog.debug(msg)
+
+def warn(msg):
+    PathLog.warning(msg)
+
+def err(msg):
+    PathLog.error(msg)
 
 def processArguments(argstring):
     # pylint: disable=global-statement
@@ -117,6 +186,8 @@ def processArguments(argstring):
     global MODAL
     global USE_TLO
     global OUTPUT_DOUBLES
+    global SEGMENTS_PER_CM_ARC
+    global BREAK_STRAIGHTS
 
     try:
         args = parser.parse_args(shlex.split(argstring))
@@ -130,6 +201,9 @@ def processArguments(argstring):
             SHOW_EDITOR = False
         print("Show editor = %d" % SHOW_EDITOR)
         PRECISION = args.precision
+
+        SEGMENTS_PER_CM_ARC = min(max(float(args.segments), 1), 100)
+        print(SEGMENTS_PER_CM_ARC)
         if args.preamble is not None:
             PREAMBLE = args.preamble
         if args.postamble is not None:
@@ -146,6 +220,8 @@ def processArguments(argstring):
         if args.axis_modal:
             print ('here')
             OUTPUT_DOUBLES = False
+        if args.break_straight:
+            BREAK_STRAIGHTS = True
 
     except Exception: # pylint: disable=broad-except
         return False
@@ -171,12 +247,13 @@ def export(objectslist, filename, argstring):
 
     # write header
     if OUTPUT_HEADER:
-        gcode += linenumber() + ";Exported by Snapmaker\n"
+        gcode += linenumber() + ";Exported for Snapmaker 2\n"
         gcode += linenumber() + ";Post Processor: " + __name__ + "\n"
         gcode += linenumber() + ";Output Time:" + str(now) + "\n"
-        gcode += linenumber() + "\n"
-        gcode += linenumber() + "G0 Z10.00 F120" + "\n"
-        gcode += linenumber() + "G0 Z0.50 F120" + "\n"
+        gcode += linenumber() + PREAMBLE + "\n"        
+        gcode += linenumber() + "G0 Z10.00 F300" + "\n"
+        # gcode += linenumber() + "G0 Z0.50 F120" + "\n"
+        PathLog.debug("===== Post-process for Snapmaker 2 (export linear moves only) =====\n")
 
     gcode += linenumber() + UNITS + "\n"
 
@@ -262,6 +339,19 @@ def linenumber():
     return ""
 
 
+def createCommand(command, x, y, z, feedrate):
+    precision_string = '.' + str(PRECISION) + 'f'
+
+    xFormatted = format(float(x), precision_string)
+    yFormatted = format(float(y), precision_string)
+    zFormatted = format(float(z), precision_string)
+    feedrateFormatted = format(float(feedrate), precision_string)
+    return linenumber() + "{command} X{x} Y{y} Z{z} F{feedrate}\n".format(command=command, x=xFormatted, y=yFormatted, z=zFormatted, feedrate=feedrateFormatted)
+
+def createNoPosCommand(command, params):
+    return linenumber() + "{command} {params}\n".format(command=command, params=params)
+
+
 def parse(pathobj):
     # pylint: disable=global-statement
     global PRECISION
@@ -269,37 +359,41 @@ def parse(pathobj):
     global OUTPUT_DOUBLES
     global UNIT_FORMAT
     global UNIT_SPEED_FORMAT
+    global SEGMENTS_PER_CM_ARC
+
+    global feedrateHorizontal
+    global feedrateVertical
 
     out = ""
     lastcommand = None
     precision_string = '.' + str(PRECISION) + 'f'
-    currLocation = {}  # keep track for no doubles
 
     # the order of parameters
     # linuxcnc doesn't want K properties on XY plane  Arcs need work.
     params = ['X', 'Y', 'Z', 'A', 'B', 'C', 'I', 'J', 'F', 'S', 'T', 'Q', 'R', 'L', 'H', 'D', 'P']
     firstmove = Path.Command("G0", {"X": -1, "Y": -1, "Z": -1, "F": 0.0})
-    currLocation.update(firstmove.Parameters)  # set First location Parameters
 
     if hasattr(pathobj, "Group"):  # We have a compound or project.
         # if OUTPUT_COMMENTS:
         #     out += linenumber() + "(compound: " + pathobj.Label + ")\n"
-        for p in pathobj.Group:
+        for p in pathobj.Group:            
             out += parse(p)
         return out
     else:  # parsing simple path
-
+        log("=== " + pathobj.Name + "===")
+        
         # groups might contain non-path things like stock.
         if not hasattr(pathobj, "Path"):
             return out
 
         for c in pathobj.Path.Commands:
+            log("Next: " + str(c))
 
             outstring = []
             command = c.Name
-            outstring.append(command)
 
-            if command not in COMMANDS:
+            if command[0] == '(':
+                outstring.append(';' + command + '\n')
                 continue
 
             # if modal: suppress the command if it is the same as the last one
@@ -307,38 +401,139 @@ def parse(pathobj):
                 if command == lastcommand:
                     outstring.pop(0)
 
-            if c.Name[0] == '(': # command is a comment
-                continue
+            # Find feedrate and assign to either horizontal or vertical speed
+            if P_FEEDRATE in c.Parameters:
+                readFeedrate = c.Parameters[P_FEEDRATE]
 
-            # Now add the remaining parameters in order
-            for param in params:
-                if param in c.Parameters:
-                    if param == 'F' and (currLocation[param] != c.Parameters[param] or OUTPUT_DOUBLES):
-                        if c.Name not in ["G0", "G00"]:  # linuxcnc doesn't use rapid speeds
-                            speed = Units.Quantity(c.Parameters['F'], FreeCAD.Units.Velocity)
-                            if speed.getValueAs(UNIT_SPEED_FORMAT) > 0.0:
-                                outstring.append(param + format(float(speed.getValueAs(UNIT_SPEED_FORMAT)), precision_string))
+                speed = Units.Quantity(readFeedrate, FreeCAD.Units.Velocity)
+                feedrateString = 0
+                if speed.getValueAs(UNIT_SPEED_FORMAT) > 0.0:
+                    feedrateString = float(speed.getValueAs(UNIT_SPEED_FORMAT))
+
+                if feedrateString > 0:
+                    if P_POSITION_Z in c.Parameters:
+                        if not c.Parameters[P_POSITION_Z] == currentHeadPosition.z:
+                            if not feedrateVertical == feedrateString:
+                                err("New Vertical Feedrate " + str(feedrateString))
+                            feedrateVertical = feedrateString                            
                         else:
-                            continue
-                    elif param == 'T':
-                        outstring.append(param + str(int(c.Parameters['T'])))
-                    elif param == 'H':
-                        outstring.append(param + str(int(c.Parameters['H'])))
-                    elif param == 'D':
-                        outstring.append(param + str(int(c.Parameters['D'])))
-                    elif param == 'S':
-                        outstring.append(param + str(int(c.Parameters['S'])))
+                            if not feedrateHorizontal == feedrateString:
+                                warn("New Horizontal Feedrate " + str(feedrateString))
+                            feedrateHorizontal = feedrateString
+                            
                     else:
-                        if (not OUTPUT_DOUBLES) and (param in currLocation) and (currLocation[param] == c.Parameters[param]):
-                            continue
-                        else:
-                            pos = Units.Quantity(c.Parameters[param], FreeCAD.Units.Length)
-                            outstring.append(
-                                param + format(float(pos.getValueAs(UNIT_FORMAT)), precision_string))
+                        feedrateHorizontal = feedrateString
+                        if not feedrateHorizontal == feedrateString:
+                            warn("New Horizontal Feedrate " + str(feedrateString))
+                        warn("New Horizontal Feedrate " + str(feedrateHorizontal))    
 
-            # store the latest command
-            lastcommand = command
-            currLocation.update(c.Parameters)
+            if command in commandsToSimulate:
+                if command == CMD_HOLE_SIMPLE or command == CMD_HOLE_DWELL or command == CMD_HOLE_PECKED:                   
+                    posX = c.Parameters[P_POSITION_X]
+                    posY = c.Parameters[P_POSITION_Y]
+                    posZ = c.Parameters[P_POSITION_Z]
+                    retractHeight = c.Parameters[P_DRILL_RETRACT_HEIGHT]
+
+                    # In case a pecking statement is provided (usually G83)                    
+                    peckDepth = 0
+                    peckCount = 0
+                    if P_PECK_DEPTH in c.Parameters:
+                        peckDepth = c.Parameters[P_PECK_DEPTH]
+                        totalToDrill = currentHeadPosition.z - posZ
+                        warn("total drill:" +str(totalToDrill)+ " peckDepth: "+str(peckDepth))
+                        peckCount = math.floor(totalToDrill/peckDepth)
+
+                    # In case a dwell statement is provided (G82, G83)
+                    dwellTimeMs = 0
+                    if P_DWELL_MS in c.Parameters:
+                        dwellTimeMs = float(c.Parameters[P_DWELL_MS])
+                    if P_DWELL_S in c.Parameters:
+                        dwellTimeMs = float(c.Parameters[P_DWELL_S] * 1000) 
+
+                    cmdOverHole     = createCommand("G1", posX, posY, currentHeadPosition.z , feedrateHorizontal)
+                    cmdEnteringHole = createCommand("G1", posX, posY, posZ , feedrateVertical)
+                    cmdLeavingHole  = createCommand("G1", posX, posY, retractHeight , feedrateVertical*holeRetractionFactor)                   
+
+                    # move over hole
+                    outstring.append(cmdOverHole)
+
+                    # do pecking moves if parameter was found
+                    if peckCount > 0:
+                        for peckNumber in range(peckCount):
+                            commandPeck = createCommand("G1", posX, posY, currentHeadPosition.z - (peckNumber+1) * peckDepth , feedrateVertical)
+                            outstring.append(commandPeck)
+                            outstring.append(cmdLeavingHole)   
+
+                    # move fully into hole
+                    outstring.append(cmdEnteringHole)
+
+                    # dwell in the finished hole if parameter was found
+                    if dwellTimeMs > 0:
+                        outstring.append(createNoPosCommand("G4","P"+str(dwellTimeMs)))
+
+                    # leave the hole
+                    outstring.append(cmdLeavingHole)      
+
+                    if not moveDrillInRetractHeight:
+                        outstring.append(cmdOverHole)                                              
+
+            elif command in commandsToConvert:
+                edgeOfCommand = PathGeom.edgeForCmd(c, FreeCAD.Vector(currentHeadPosition) )
+
+                if not (edgeOfCommand == None):
+                    requiredPointsForArc = 2 # only two points for all straight commands            
+
+                    #break all non-straight commands
+                    if c.Name not in ["G0", "G00", "G1", "G01"] or BREAK_STRAIGHTS:
+                        requiredPointsForArc = 1 + math.ceil(edgeOfCommand.Length * (SEGMENTS_PER_CM_ARC / 10))
+
+                    discretePoints = edgeOfCommand.copy().discretize(requiredPointsForArc)
+
+                    for p in discretePoints[1:]:
+                        # segmentCommand = "G1 X"+str(p.x)+" Y"+str(p.y)+" Z"+str(p.z)+"\n"
+
+                        adaptiveFeedrate = min(feedrateVertical, feedrateHorizontal)
+                        if P_POSITION_Z in c.Parameters:
+                            posZ = c.Parameters[P_POSITION_Z]
+                            if posZ == currentHeadPosition.z:
+                                adaptiveFeedrate = feedrateHorizontal
+                        else:
+                            adaptiveFeedrate = feedrateHorizontal
+
+                        segmentCommand = createCommand("G1",p.x, p.y, p.z, adaptiveFeedrate)
+                        #log(segmentCommand)
+                        outstring.append(segmentCommand)
+                    log(" ▶ broke shape into " + str(len(discretePoints)) + " segments")
+            elif command == CMD_SPINDLE_ON:
+                rpmSet = int(c.Parameters[P_SPINDLE_RPM])
+                powerToSet = rpmSet / maxSpindleRPM * maxSpindlePower
+                if powerToSet < minSpindlePower:
+                    powerToSet = minSpindlePower
+                if powerToSet > maxSpindlePower:
+                    powerToSet = maxSpindlePower
+
+                outstring.append(createNoPosCommand(CMD_SPINDLE_ON, P_SPINDLE_POWER + str(powerToSet)))
+            else:
+                outstring.append(command)     
+
+            #remember the last position moved to
+            if not (command == CMD_HOLE_SIMPLE or command == CMD_HOLE_DWELL or command == CMD_HOLE_PECKED):
+                for param in c.Parameters:
+                    if param == "X":
+                        currentHeadPosition.x = c.Parameters[param]
+                    if param == "Y":
+                        currentHeadPosition.y = c.Parameters[param]
+                    if param == "Z":
+                        currentHeadPosition.z = c.Parameters[param]
+            else:
+                for param in c.Parameters:
+                    if param == "X":
+                        currentHeadPosition.x = c.Parameters[param]
+                    if param == "Y":
+                        currentHeadPosition.y = c.Parameters[param]
+                if moveDrillInRetractHeight:
+                    drillRetractHeight = c.Parameters[P_DRILL_RETRACT_HEIGHT]
+                    currentHeadPosition.z = drillRetractHeight
 
             if command == "message":
                 if OUTPUT_COMMENTS is False:
@@ -353,7 +548,7 @@ def parse(pathobj):
 
                 # append the line to the final output
                 for w in outstring:
-                    out += w + COMMAND_SPACE
+                    out += w
                 out = out.strip() + "\n"
 
         return out
