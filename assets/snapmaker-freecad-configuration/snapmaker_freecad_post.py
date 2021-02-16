@@ -32,6 +32,7 @@ from PathScripts import PathUtils
 import PathScripts.PathLog as PathLog
 import PathGeom
 import math
+import base64
 
 LOG_MODULE = PathLog.thisModule()
 PathLog.setLevel(PathLog.Level.ERROR, LOG_MODULE)
@@ -245,11 +246,23 @@ def export(objectslist, filename, argstring):
     print("postprocessing...")
     gcode = ""
 
+    # prepare to take picture
+    FreeCAD.Gui.activeDocument().activeView().viewIsometric()
+    FreeCAD.Gui.SendMsgToActiveView("ViewFit")
+    imagePath = FreeCAD.Gui.activeDocument().Document.FileName + ".png"
+    FreeCAD.Gui.activeDocument().activeView().saveImage(imagePath,720,480,'White')
+
+    imageBase64 = ""
+    with open(imagePath, "rb") as image_file:
+        imageBase64 = base64.b64encode(image_file.read())
+
     # write header
     if OUTPUT_HEADER:
         gcode += linenumber() + ";Exported for Snapmaker 2\n"
         gcode += linenumber() + ";Post Processor: " + __name__ + "\n"
         gcode += linenumber() + ";Output Time:" + str(now) + "\n"
+        if not imageBase64 == "":
+            gcode += linenumber() + ";Header Start\n;header_type: cnc\n;thumbnail: data:image/png;base64,"+ imageBase64.decode() + "\n;Header End\n"
         gcode += linenumber() + PREAMBLE + "\n"        
         gcode += linenumber() + "G0 Z10.00 F300" + "\n"
         # gcode += linenumber() + "G0 Z0.50 F120" + "\n"
