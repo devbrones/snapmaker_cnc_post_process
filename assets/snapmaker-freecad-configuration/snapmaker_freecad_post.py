@@ -57,7 +57,7 @@ parser.add_argument('--no-comments', action='store_true', help='suppress comment
 parser.add_argument('--line-numbers', action='store_true', help='prefix with line numbers')
 parser.add_argument('--no-show-editor', action='store_true', help='don\'t pop up editor before writing output')
 parser.add_argument('--precision', default='3', help='number of digits of precision, default=3')
-parser.add_argument('--segments', default='20', help='segments in curved paths: segs/cm, default=40')
+parser.add_argument('--segments', default='10', help='segments in curved paths: segs/cm, default=40')
 parser.add_argument('--break-straight', action='store_true', help='breaks also straight paths same resolution as in curved paths')
 parser.add_argument('--preamble', help='set commands to be issued before the first command, default="G17\nG90"')
 parser.add_argument('--postamble', help='set commands to be issued after the last command, default="M05\nG17 G90\nM2"')
@@ -131,7 +131,7 @@ OUTPUT_DOUBLES = True  # if false duplicate axis values are suppressed if the sa
 COMMAND_SPACE = " "
 
 LINENR = 100  # line number starting value
-SEGMENTS_PER_CM_ARC = 80 # Numbers of segments an arc should be broken into within 1cm of arc distance
+SEGMENTS_PER_CM_ARC = 40 # Numbers of segments an arc should be broken into within 1cm of arc distance
 BREAK_STRAIGHTS = False # When True, straight lines will be broken into subsegments as curved paths
 
 # These globals will be reflected in the Machine configuration of the project
