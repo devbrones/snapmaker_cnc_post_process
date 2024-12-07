@@ -65,6 +65,7 @@ parser.add_argument('--inches', action='store_true', help='Convert output for US
 parser.add_argument('--modal', action='store_true', help='Output the Same G-command Name USE NonModal Mode')
 parser.add_argument('--axis-modal', action='store_true', help='Output the Same Axis Value Mode')
 parser.add_argument('--no-tlo', action='store_true', help='suppress tool length offset (G43) following tool changes')
+parser.add_argument('--leveltwocnc', action='store_true', help='Use the new Snapmaker 200W cnc toolhead')
 
 TOOLTIP_ARGS = parser.format_help()
 
@@ -75,7 +76,7 @@ CMD_MOVE_LINEAR       = 'G1'
 CMD_MOVE_ARC_CW       = 'G2'
 CMD_MOVE_ARC_CCW      = 'G3'
 CMD_MOVE_BEZIER       = 'G5'
-CMD_SPINDLE_ON        = 'M3'
+CMD_SPINDLE_ON        = 'M3' # variable spindle speed, needs M3 <0-100%>
 CMD_SPINDLE_OFF       = 'M5'
 CMD_HOLE_SIMPLE       = 'G81'
 CMD_HOLE_DWELL        = 'G82' 
@@ -99,11 +100,20 @@ P_DWELL_S = 'S'
 
 # =============================================================================
 # Machine specific constants
+class SMCNC:
+    header = "standardCNCToolheadForSM2"
+    minSpindleRPM = 6000
+    minSpindlePower = 50
+    maxSpindleRPM = 12000
+    maxSpindlePower = 100
 
-minSpindleRPM = 6000
-minSpindlePower = 50
-maxSpindleRPM = 12000
-maxSpindlePower = 100
+class ARCNC:
+    header = "levelTwoCNCToolheadForSM2"
+    minSpindleRPM = 8000
+    minSpindlePower = 0
+    maxSpindleRPM = 18000
+    maxSpindlePower = 100
+
 
 # =============================================================================
 moveDrillInRetractHeight = False
@@ -160,6 +170,8 @@ TOOL_CHANGE = ''''''
 
 currentHeadPosition = FreeCAD.Vector(0,0,0)
 
+TOOLHEAD = None
+
 # to distinguish python built-in open function from the one declared below
 if open.__module__ in ['__builtin__','io']:
     pythonopen = open
@@ -190,6 +202,7 @@ def processArguments(argstring):
     global OUTPUT_DOUBLES
     global SEGMENTS_PER_CM_ARC
     global BREAK_STRAIGHTS
+    global TOOLHEAD
 
     try:
         args = parser.parse_args(shlex.split(argstring))
@@ -224,6 +237,10 @@ def processArguments(argstring):
             OUTPUT_DOUBLES = False
         if args.break_straight:
             BREAK_STRAIGHTS = True
+        if args.leveltwocnc:
+            TOOLHEAD = ARCNC()
+        else:
+            TOOLHEAD = SMCNC()
 
     except Exception: # pylint: disable=broad-except
         return False
@@ -263,7 +280,7 @@ def export(objectslist, filename, argstring):
         gcode += linenumber() + ";Post Processor: " + __name__ + "\n"
         gcode += linenumber() + ";Output Time:" + str(now) + "\n"
         if not imageBase64 == "":
-            gcode += linenumber() + ";Header Start\n;header_type: cnc\n;thumbnail: data:image/png;base64,"+ imageBase64.decode() + "\n;Header End\n"
+            gcode += linenumber() + ";Header Start\n;header_type: cnc\n;tool_head: " + TOOLHEAD.header + "\n;machine: "+ MACHINE_NAME +"\n;gcode_flavor: marlin" "\n;thumbnail: data:image/png;base64,"+ imageBase64.decode() + "\n;Header End\n"
         gcode += linenumber() + PREAMBLE + "\n"        
         gcode += linenumber() + "G0 Z10.00 F300" + "\n"
         # gcode += linenumber() + "G0 Z0.50 F120" + "\n"
@@ -428,18 +445,18 @@ def parse(pathobj):
                     if P_POSITION_Z in c.Parameters:
                         if not c.Parameters[P_POSITION_Z] == currentHeadPosition.z:
                             if not feedrateVertical == feedrateString:
-                                err("New Vertical Feedrate " + str(feedrateString))
+                                log("New Vertical Feedrate " + str(feedrateString))
                             feedrateVertical = feedrateString                            
                         else:
                             if not feedrateHorizontal == feedrateString:
-                                warn("New Horizontal Feedrate " + str(feedrateString))
+                                log("New Horizontal Feedrate " + str(feedrateString))
                             feedrateHorizontal = feedrateString
                             
                     else:
                         feedrateHorizontal = feedrateString
                         if not feedrateHorizontal == feedrateString:
-                            warn("New Horizontal Feedrate " + str(feedrateString))
-                        warn("New Horizontal Feedrate " + str(feedrateHorizontal))    
+                            log("New Horizontal Feedrate " + str(feedrateString))
+                        log("New Horizontal Feedrate " + str(feedrateHorizontal))    
 
             if command in commandsToSimulate:
                 if command == CMD_HOLE_SIMPLE or command == CMD_HOLE_DWELL or command == CMD_HOLE_PECKED:                   
@@ -520,12 +537,11 @@ def parse(pathobj):
                     log(" ▶ broke shape into " + str(len(discretePoints)) + " segments")
             elif command == CMD_SPINDLE_ON:
                 rpmSet = int(c.Parameters[P_SPINDLE_RPM])
-                powerToSet = rpmSet / maxSpindleRPM * maxSpindlePower
-                if powerToSet < minSpindlePower:
-                    powerToSet = minSpindlePower
-                if powerToSet > maxSpindlePower:
-                    powerToSet = maxSpindlePower
-
+                powerToSet = rpmSet / TOOLHEAD.maxSpindleRPM * TOOLHEAD.maxSpindlePower
+                if powerToSet < TOOLHEAD.minSpindlePower:
+                    powerToSet = TOOLHEAD.minSpindlePower
+                if powerToSet > TOOLHEAD.maxSpindlePower:
+                    powerToSet = TOOLHEAD.maxSpindlePower 
                 outstring.append(createNoPosCommand(CMD_SPINDLE_ON, P_SPINDLE_POWER + str(powerToSet)))
             else:
                 outstring.append(command)     
