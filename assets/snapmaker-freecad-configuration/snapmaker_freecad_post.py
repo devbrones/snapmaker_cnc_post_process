@@ -82,6 +82,17 @@ CMD_HOLE_SIMPLE       = 'G81'
 CMD_HOLE_DWELL        = 'G82' 
 CMD_HOLE_PECKED       = 'G83' 
 
+MOVE_COMMANDS = [ #this is a hoorrrriiibbleee way of doing it but i dont care:D
+    CMD_MOVE_LINEAR_RAPID +" ",
+    CMD_MOVE_LINEAR + " ",
+    CMD_MOVE_ARC_CW + " ",
+    CMD_MOVE_ARC_CCW + " ",
+    CMD_MOVE_BEZIER + " ",
+    CMD_HOLE_SIMPLE + " ",
+    CMD_HOLE_DWELL + " ",
+    CMD_HOLE_PECKED + " "       
+]
+
 # Param: Movement
 P_POSITION_X = 'X'
 P_POSITION_Y = 'Y'
@@ -203,6 +214,7 @@ def processArguments(argstring):
     global SEGMENTS_PER_CM_ARC
     global BREAK_STRAIGHTS
     global TOOLHEAD
+    global MOVE_COMMANDS
 
     try:
         args = parser.parse_args(shlex.split(argstring))
@@ -339,6 +351,48 @@ def export(objectslist, filename, argstring):
         gcode += ";begin postamble\n"
     for line in POSTAMBLE.splitlines(True):
         gcode += linenumber() + line
+
+    # generate boundary
+
+    Xmoves=[]
+    Ymoves=[]
+    Zmoves=[]
+    Bmoves=[0] # placeholder
+    for line in gcode.split("\n"):
+        #print(line)
+        if any(move_command in line for move_command in MOVE_COMMANDS):
+            command = line.split()
+            # add all x,y,z position values to a list
+            if len(list(filter(lambda x: "X" in x, command))):
+                Xmoves.append(float(list(filter(lambda x: "X" in x, command))[0][1:]))
+            if len(list(filter(lambda x: "Y" in x, command))):
+                Ymoves.append(float(list(filter(lambda y: "Y" in y, command))[0][1:]))
+            if len(list(filter(lambda x: "Z" in x, command))):
+                Zmoves.append(float(list(filter(lambda z: "Z" in z, command))[0][1:]))
+
+    #;max_x(mm): 35.512     # Example boundary headers
+    #;max_y(mm): 318.811    # 
+    #;max_z(mm): 80         # 
+    #;max_b(mm): 0          # maybe b is rotary? have no idea
+    #;min_x(mm): 20.232     # 
+    #;min_y(mm): 315.667    # 
+    #;min_b(mm): 0          # 
+    #;min_z(mm): -2         # 
+
+    # create boundary string
+    bdry = f""";max_x(mm): {max(Xmoves)}
+;max_y(mm): {max(Ymoves)}
+;max_z(mm): {max(Zmoves)}
+;max_b(mm): {max(Bmoves)}
+;min_x(mm): {min(Xmoves)}
+;min_y(mm): {min(Ymoves)}
+;min_b(mm): {min(Bmoves)}
+;min_z(mm): {min(Zmoves)}\n"""
+
+    #add the boundary string to the preamble
+    preamble_position = gcode.find(";thumbnail: data:image/png;base64") # will give the position of the first letter
+    gcode = gcode[:preamble_position] + bdry + gcode[preamble_position:]
+
 
     if FreeCAD.GuiUp and SHOW_EDITOR:
         dia = PostUtils.GCodeEditorDialog()
